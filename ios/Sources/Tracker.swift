@@ -6,9 +6,10 @@ import CoreLocation
 /// with the target's RSSI-derived range, and multilaterates the target.
 ///
 /// Position source: inertial dead reckoning first (pedometer step distance,
-/// which is accelerometer-driven, plus the gyro-fused heading from
-/// CMDeviceMotion). GPS jitters by metres — larger than the search area —
-/// so it is only a fallback for when the pedometer cannot run at all.
+/// which is accelerometer-driven, plus the heading from CLLocationManager's
+/// CLHeading — the documented, calibrated compass). GPS jitters by metres —
+/// larger than the search area — so it is only a fallback for when the
+/// pedometer cannot run at all.
 /// Sensor problems are surfaced via `notice` instead of failing silently.
 final class Tracker: NSObject, ObservableObject {
     @Published var isRunning = false
@@ -28,7 +29,6 @@ final class Tracker: NSObject, ObservableObject {
     var pathLoss = 2.0
 
     private let pedometer = CMPedometer()
-    private let motionManager = CMMotionManager()
     private let locationManager = CLLocationManager()
     private var samples: [SamplePoint] = []
     private var lastPedometerDistance = 0.0
@@ -37,11 +37,10 @@ final class Tracker: NSObject, ObservableObject {
     private var originLat: Double?
     private var originLon: Double?
     private var pedometerFailed = false
-    private var headingFromMotion = false
     private var pedometerErrorReported = false
 
     /// "慣性モード" while the pedometer drives the position, "GPSモード" in fallback.
-    var modeText: String { pedometerFailed ? "GPSモード（予備）" : "慣性モード（歩数＋ジャイロ方位）" }
+    var modeText: String { pedometerFailed ? "GPSモード（予備）" : "慣性モード（歩数＋コンパス方位）" }
 
     /// Farthest any track point is from the start point (movement check).
     var maxSpreadFromStart: Double {
@@ -62,9 +61,8 @@ final class Tracker: NSObject, ObservableObject {
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()  // GPS fallback + authorization only
         if CLLocationManager.headingAvailable() {
-            locationManager.startUpdatingHeading()  // fallback if device motion is unavailable
+            locationManager.startUpdatingHeading()  // primary heading source (CLHeading)
         }
-        startMotion()
         if CMPedometer.authorizationStatus() == .denied {
             pedometerFailed = true
             notice = "モーションの許可がありません（設定→プライバシーとセキュリティ→モーションとフィットネス）。GPSモードで代替します"
@@ -76,25 +74,9 @@ final class Tracker: NSObject, ObservableObject {
 
     func stop() {
         pedometer.stopUpdates()
-        motionManager.stopDeviceMotionUpdates()
         locationManager.stopUpdatingHeading()
         locationManager.stopUpdatingLocation()
         isRunning = false
-    }
-
-    /// Gyro-fused heading from CMDeviceMotion (magnetic-north reference frame).
-    /// heading = atan2(-m22, m12) of the attitude rotation matrix.
-    private func startMotion() {
-        guard motionManager.isDeviceMotionAvailable else { return }
-        motionManager.deviceMotionUpdateInterval = 1.0 / 30.0
-        motionManager.startDeviceMotionUpdates(using: .xMagneticNorthZVertical, to: .main) { [weak self] motion, _ in
-            guard let self, let motion else { return }
-            let m = motion.attitude.rotationMatrix
-            var deg = atan2(-m.m22, m.m12) * 180 / .pi
-            if deg < 0 { deg += 360 }
-            headingDeg = deg
-            headingFromMotion = true
-        }
     }
 
     func reset() {
@@ -218,7 +200,8 @@ extension Tracker: CLLocationManagerDelegate {
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
-        guard !headingFromMotion else { return }  // device motion heading is smoother
+        // CLHeading is the heading source: trueHeading is degrees clockwise
+        // from true north (0 = north, 90 = east), already calibrated by iOS.
         let h = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
         headingDeg = h
     }

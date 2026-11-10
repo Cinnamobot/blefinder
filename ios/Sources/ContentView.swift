@@ -181,6 +181,7 @@ struct TrackView: View {
             }
             HStack(spacing: 16) {
                 Text("開始地点から \(String(format: "%.1f", tracker.distanceFromOrigin)) m")
+                Text("方位 \(Int(tracker.headingDeg.rounded()))°")
                 Text(tracker.modeText)
                 if tracker.usingGPS, let acc = tracker.gpsAccuracy {
                     Text("GPS ±\(String(format: "%.0f", acc)) m")
@@ -324,7 +325,7 @@ struct HelpView: View {
                     Text("4. 赤い丸が推定位置。スマホを体の前に離して持つと精度が上がる")
                 }
                 Section("しくみ") {
-                    Text("電波の強さ（RSSI）から距離を推し量り、歩いた軌跡上の各地点からの距離を集めて、最もつじつまの合う一点を計算しています（多点測位）。あなたの移動は加速度センサー由来の歩数・歩行距離と、ジャイロで補正した方位で記録します（GPSは数メートルぶれるので予備扱い）。地図はレーダー表示だと端末の向きに追随して回ります。")
+                    Text("電波の強さ（RSSI）から距離を推し量り、歩いた軌跡上の各地点からの距離を集めて、最もつじつまの合う一点を計算しています（多点測位）。あなたの移動は加速度センサー由来の歩数・歩行距離と、標準コンパス（真北基準）の方位で記録します（GPSは数メートルぶれるので予備扱い）。地図はレーダー表示だと端末の向きに追随して回ります。統計行の「方位」が、北を向いたとき0°前後になっていればコンパスは正常です。")
                 }
                 Section("限界") {
                     Text("・画面を開いている間だけ動作します（バックグラウンド不可）")
