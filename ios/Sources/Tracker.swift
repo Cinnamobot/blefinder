@@ -2,19 +2,24 @@ import Foundation
 import CoreMotion
 import CoreLocation
 
-/// A tracking session: dead-reckons the user's own movement with the
-/// pedometer (distance) + compass (heading), pairs each position with the
-/// target's RSSI-derived range, and multilaterates the target's position.
+/// A tracking session: records the user's own movement, pairs each position
+/// with the target's RSSI-derived range, and multilaterates the target.
+///
+/// Position source priority: GPS (when a decent fix is available) first,
+/// pedometer + compass dead reckoning as the indoor fallback. Sensor
+/// problems are surfaced via `notice` instead of failing silently.
 final class Tracker: NSObject, ObservableObject {
     @Published var isRunning = false
     @Published var posX = 0.0   // east of start, metres
     @Published var posY = 0.0   // north of start, metres
     @Published var headingDeg = 0.0
-    @Published var track: [(x: Double, y: Double)] = [(0, 0)]
+    @Published var track: [(x: Double, y: Double)] = []
     @Published var result: SolveResult?
     @Published var sampleCount = 0
     @Published var latestRange: Double?
     @Published var notice = ""
+    @Published var gpsAccuracy: Double?
+    @Published var usingGPS = false
 
     /// Calibration: RSSI expected at 1 m, and the path-loss exponent.
     var txPower = -59.0
@@ -25,52 +30,80 @@ final class Tracker: NSObject, ObservableObject {
     private var samples: [SamplePoint] = []
     private var lastPedometerDistance = 0.0
     private var lastSampleAt = Date.distantPast
-    private var sessionStart = Date()
+    private var originLat: Double?
+    private var originLon: Double?
+    private var lastGPSAt = Date.distantPast
+    private var pedometerErrorReported = false
+
+    /// Farthest any track point is from the start point (movement check).
+    var maxSpreadFromStart: Double {
+        track.map { hypot($0.x, $0.y) }.max() ?? 0
+    }
+    var distanceFromOrigin: Double { hypot(posX, posY) }
 
     override init() {
         super.init()
         locationManager.delegate = self
         locationManager.headingOrientation = .portrait
+        locationManager.desiredAccuracy = kCLLocationAccuracyBest
+        locationManager.distanceFilter = kCLDistanceFilterNone
     }
 
     func start() {
-        sessionStart = Date()
-        lastPedometerDistance = 0
         locationManager.requestWhenInUseAuthorization()
+        locationManager.startUpdatingLocation()
         if CLLocationManager.headingAvailable() {
             locationManager.startUpdatingHeading()
-        } else {
-            notice = "この端末ではコンパスが使えません"
         }
-        guard CMPedometer.isDistanceAvailable() else {
-            notice = "この端末では歩行距離が測れません"
-            return
+        if CMPedometer.authorizationStatus() == .denied {
+            notice = "モーションの許可がありません（設定→プライバシーとセキュリティ→モーションとフィットネス）。GPSが使えない場所では移動を記録できません"
         }
-        pedometer.startUpdates(from: sessionStart) { [weak self] data, _ in
-            guard let self, let data, let dist = data.distance else { return }
-            DispatchQueue.main.async { self.handlePedometer(total: dist.doubleValue) }
-        }
+        startPedometer()
+        pedometerErrorReported = false
         isRunning = true
-        notice = ""
     }
 
     func stop() {
         pedometer.stopUpdates()
         locationManager.stopUpdatingHeading()
+        locationManager.stopUpdatingLocation()
         isRunning = false
     }
 
     func reset() {
-        let wasRunning = isRunning
-        if wasRunning { stop() }
         samples = []
-        track = [(0, 0)]
+        track = []
         posX = 0; posY = 0
         result = nil
         sampleCount = 0
         latestRange = nil
+        originLat = nil; originLon = nil
+        lastGPSAt = .distantPast
+        usingGPS = false
+        gpsAccuracy = nil
         lastPedometerDistance = 0
-        if wasRunning { start() }
+        if isRunning {
+            pedometer.stopUpdates()
+            startPedometer()
+        }
+    }
+
+    private func startPedometer() {
+        guard CMPedometer.isDistanceAvailable() else { return }
+        pedometer.startUpdates(from: Date()) { [weak self] data, error in
+            guard let self else { return }
+            if let error {
+                DispatchQueue.main.async {
+                    if !self.pedometerErrorReported {
+                        self.pedometerErrorReported = true
+                        self.notice = "歩行データを取得できませんでした（\(error.localizedDescription)）。GPSで代替します"
+                    }
+                }
+                return
+            }
+            guard let data, let dist = data.distance else { return }
+            DispatchQueue.main.async { self.handlePedometer(total: dist.doubleValue) }
+        }
     }
 
     func addRSSI(_ rssi: Double) {
@@ -100,24 +133,67 @@ final class Tracker: NSObject, ObservableObject {
         return (dist, rel)
     }
 
+    private func setPosition(x: Double, y: Double) {
+        posX = x; posY = y
+        if let last = track.last {
+            if hypot(x - last.x, y - last.y) > 0.5 {
+                track.append((x, y))
+                if track.count > 600 { track.removeFirst(track.count - 600) }
+            }
+        } else {
+            track.append((x, y))
+        }
+    }
+
     private func handlePedometer(total: Double) {
         let delta = total - lastPedometerDistance
         lastPedometerDistance = total
         guard delta > 0.03, delta < 5 else { return }
+        // GPS is fresh: trust it over dead reckoning.
+        if usingGPS, Date().timeIntervalSince(lastGPSAt) < 10 { return }
+        usingGPS = false
         let rad = headingDeg * .pi / 180
-        posX += delta * sin(rad)
-        posY += delta * cos(rad)
-        if let last = track.last, hypot(posX - last.x, posY - last.y) > 0.4 {
-            track.append((posX, posY))
-            if track.count > 600 { track.removeFirst(track.count - 600) }
+        setPosition(x: posX + delta * sin(rad), y: posY + delta * cos(rad))
+    }
+
+    private func handleLocation(_ location: CLLocation) {
+        let acc = location.horizontalAccuracy
+        gpsAccuracy = acc >= 0 ? acc : nil
+        guard acc >= 0, acc <= 30 else { return }  // too rough to anchor on
+        if originLat == nil {
+            originLat = location.coordinate.latitude
+            originLon = location.coordinate.longitude
+            setPosition(x: 0, y: 0)
         }
+        guard let lat0 = originLat, let lon0 = originLon else { return }
+        let metersPerDegLon = 111_320.0 * cos(lat0 * .pi / 180)
+        let metersPerDegLat = 110_574.0
+        let x = (location.coordinate.longitude - lon0) * metersPerDegLon
+        let y = (location.coordinate.latitude - lat0) * metersPerDegLat
+        lastGPSAt = Date()
+        usingGPS = true
+        setPosition(x: x, y: y)
     }
 }
 
 extension Tracker: CLLocationManagerDelegate {
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard isRunning, let last = locations.last else { return }
+        handleLocation(last)
+    }
+
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
         let h = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
         headingDeg = h
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        switch manager.authorizationStatus {
+        case .denied, .restricted:
+            notice = "位置情報の許可がありません（設定→プライバシーとセキュリティ→位置情報サービス）。GPSと方位が使えません"
+        default:
+            break
+        }
     }
 
     func locationManagerShouldDisplayHeadingCalibration(_ manager: CLLocationManager) -> Bool {

@@ -161,13 +161,28 @@ struct TrackView: View {
     }
 
     private var statsRow: some View {
-        HStack(spacing: 16) {
-            Text("サンプル \(tracker.sampleCount)")
-            if let d = tracker.latestRange {
-                Text("今の推定距離 \(String(format: "%.1f", d)) m")
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 16) {
+                Text("サンプル \(tracker.sampleCount)")
+                if let d = tracker.latestRange {
+                    Text("今の推定距離 \(String(format: "%.1f", d)) m")
+                }
+                if let r = tracker.result {
+                    Text("横の広がり \(String(format: "%.1f", r.lateralSpread)) m")
+                }
             }
-            if let r = tracker.result {
-                Text("横の広がり \(String(format: "%.1f", r.lateralSpread)) m")
+            HStack(spacing: 16) {
+                Text("開始地点から \(String(format: "%.1f", tracker.distanceFromOrigin)) m")
+                if tracker.usingGPS, let acc = tracker.gpsAccuracy {
+                    Text("GPS ±\(String(format: "%.0f", acc)) m")
+                } else {
+                    Text("GPS待ち（歩数計で代替中）")
+                }
+            }
+            if tracker.isRunning, tracker.sampleCount >= 8, tracker.maxSpreadFromStart < 0.5 {
+                Label("自分の位置がほとんど動いていません。歩行が検出できていないと方向は出せません（モーションの許可、屋外ではGPS受信を確認）",
+                      systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
             }
         }
         .font(.footnote)
