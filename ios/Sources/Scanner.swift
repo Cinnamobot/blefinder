@@ -16,6 +16,10 @@ final class Scanner: NSObject, ObservableObject {
     @Published var targetID: UUID?
     /// Latest smoothed RSSI of the selected target (nil when not seen recently).
     @Published var targetRSSI: Double?
+    /// When true, the published device list is frozen so rows stop jumping
+    /// around while the user aims for one. Scanning and target RSSI keep
+    /// running underneath; only the list display is held.
+    @Published var listFrozen = false
 
     /// Called with the target's smoothed RSSI on every advertisement.
     var onTargetSample: ((Double) -> Void)?
@@ -45,6 +49,19 @@ final class Scanner: NSObject, ObservableObject {
     func selectTarget(_ id: UUID?) {
         targetID = id
         targetRSSI = nil
+    }
+
+    func toggleListFreeze() {
+        listFrozen.toggle()
+        if !listFrozen { publishDevices() }
+    }
+
+    private func publishDevices() {
+        let now = Date()
+        lastPublish = now
+        devices = byID.values
+            .filter { now.timeIntervalSince($0.lastSeen) < 30 }
+            .sorted { $0.smoothedRSSI > $1.smoothedRSSI }
     }
 
     private func median(_ values: [Int]) -> Double {
@@ -94,12 +111,8 @@ extension Scanner: CBCentralManagerDelegate {
             onTargetSample?(smoothed)
         }
 
-        let now = Date()
-        if now.timeIntervalSince(lastPublish) > 0.3 {
-            lastPublish = now
-            devices = byID.values
-                .filter { now.timeIntervalSince($0.lastSeen) < 30 }
-                .sorted { $0.smoothedRSSI > $1.smoothedRSSI }
+        if !listFrozen, Date().timeIntervalSince(lastPublish) > 0.3 {
+            publishDevices()
         }
     }
 }

@@ -37,6 +37,24 @@ struct DeviceListView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal)
+                HStack {
+                    Button {
+                        scanner.toggleListFreeze()
+                    } label: {
+                        Label(scanner.listFrozen ? "更新を再開" : "更新を止める",
+                              systemImage: scanner.listFrozen ? "play.fill" : "pause.fill")
+                            .font(.subheadline)
+                    }
+                    .buttonStyle(.bordered)
+                    if scanner.listFrozen {
+                        Text("更新停止中 — このまま選べます")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal)
+                .padding(.bottom, 4)
                 List(scanner.devices) { dev in
                     Button {
                         scanner.selectTarget(dev.id)
