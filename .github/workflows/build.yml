@@ -9,6 +9,8 @@ jobs:
   ios:
     name: iOS app (unsigned IPA)
     runs-on: macos-15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
