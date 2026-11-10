@@ -1,0 +1,48 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ios:
+    name: iOS app (unsigned IPA)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build (no signing)
+        working-directory: ios
+        run: |
+          xcodebuild \
+            -project BLEFinder.xcodeproj \
+            -scheme BLEFinder \
+            -configuration Release \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            SYMROOT="$PWD/build" \
+            build
+
+      - name: Package unsigned IPA
+        working-directory: ios
+        run: |
+          APP_PATH=$(find build/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "app: $APP_PATH"
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry BLEFinder-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BLEFinder-ipa
+          path: ios/BLEFinder-unsigned.ipa
