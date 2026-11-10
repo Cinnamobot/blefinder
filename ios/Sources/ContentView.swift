@@ -72,6 +72,7 @@ struct TrackView: View {
     @EnvironmentObject var tracker: Tracker
     @State private var txPower = -59.0
     @State private var pathLoss = 2.0
+    @State private var headingUp = true
 
     private var targetName: String {
         scanner.devices.first { $0.id == scanner.targetID }?.name ?? "未選択"
@@ -96,10 +97,17 @@ struct TrackView: View {
                             .foregroundStyle(.secondary)
                     } else {
                         guidanceCard
-                        MapView()
+                        MapView(headingUp: headingUp)
                             .frame(height: 320)
                             .background(Color(.secondarySystemBackground))
                             .clipShape(RoundedRectangle(cornerRadius: 12))
+                        Button {
+                            headingUp.toggle()
+                        } label: {
+                            Label(headingUp ? "レーダー表示（端末の向きに追随）" : "北固定表示",
+                                  systemImage: headingUp ? "location.north.line.fill" : "compass.drawing")
+                                .font(.footnote)
+                        }
                         statsRow
                         if let result = tracker.result, result.mirror != nil {
                             Label("直線移動だけだと左右の鏡像候補が残ります。横方向にも歩くと確定します。",
@@ -173,10 +181,9 @@ struct TrackView: View {
             }
             HStack(spacing: 16) {
                 Text("開始地点から \(String(format: "%.1f", tracker.distanceFromOrigin)) m")
+                Text(tracker.modeText)
                 if tracker.usingGPS, let acc = tracker.gpsAccuracy {
                     Text("GPS ±\(String(format: "%.0f", acc)) m")
-                } else {
-                    Text("GPS待ち（歩数計で代替中）")
                 }
             }
             if tracker.isRunning, tracker.sampleCount >= 8, tracker.maxSpreadFromStart < 0.5 {
@@ -209,14 +216,34 @@ struct TrackView: View {
 
 struct MapView: View {
     @EnvironmentObject var tracker: Tracker
+    var headingUp: Bool
+
+    /// World point -> display frame. In heading-up (radar) mode the frame is
+    /// rotated around the user's current position so that the direction the
+    /// phone faces is up: sx = d·R, sy = d·F with R=(cosθ,-sinθ), F=(sinθ,cosθ).
+    private func rotated(_ p: (x: Double, y: Double)) -> (x: Double, y: Double) {
+        if !headingUp { return p }
+        let th = tracker.headingDeg * .pi / 180
+        let dx = p.x - tracker.posX, dy = p.y - tracker.posY
+        return (x: dx * cos(th) - dy * sin(th), y: dx * sin(th) + dy * cos(th))
+    }
 
     var body: some View {
         Canvas { context, size in
-            var points: [(x: Double, y: Double)] = tracker.track
+            let track = tracker.track.map(rotated)
+            var points: [(x: Double, y: Double)] = track
+            var estimate: (x: Double, y: Double)? = nil
+            var mirror: (x: Double, y: Double)? = nil
             if let r = tracker.result {
-                points.append((r.x, r.y))
-                if let m = r.mirror { points.append(m) }
+                estimate = rotated((r.x, r.y))
+                points.append(estimate!)
+                if let m = r.mirror {
+                    mirror = rotated(m)
+                    points.append(mirror!)
+                }
             }
+            let me = rotated((tracker.posX, tracker.posY))
+            points.append(me)
             guard let first = points.first else { return }
             var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
             for p in points {
@@ -230,45 +257,56 @@ struct MapView: View {
             func project(_ x: Double, _ y: Double) -> CGPoint {
                 CGPoint(x: (x - minX) * scale, y: size.height - (y - minY) * scale)
             }
+            func project(_ p: (x: Double, y: Double)) -> CGPoint { project(p.x, p.y) }
 
+            // radar rings around the user (heading-up mode)
+            let mePt = project(me)
+            if headingUp {
+                for ring in [5.0, 10.0, 20.0] {
+                    let rect = CGRect(x: mePt.x - ring * scale, y: mePt.y - ring * scale,
+                                      width: ring * scale * 2, height: ring * scale * 2)
+                    context.stroke(Path(ellipseIn: rect), with: .color(.secondary.opacity(0.25)), lineWidth: 1)
+                }
+            }
             // range circle for the latest reading
             if let d = tracker.latestRange {
-                let c = project(tracker.posX, tracker.posY)
-                let rect = CGRect(x: c.x - d * scale, y: c.y - d * scale,
+                let rect = CGRect(x: mePt.x - d * scale, y: mePt.y - d * scale,
                                   width: d * scale * 2, height: d * scale * 2)
                 context.stroke(Path(ellipseIn: rect), with: .color(.blue.opacity(0.25)), lineWidth: 1)
             }
             // walked track
-            if tracker.track.count > 1 {
+            if track.count > 1 {
                 var path = Path()
-                path.move(to: project(tracker.track[0].x, tracker.track[0].y))
-                for p in tracker.track.dropFirst() { path.addLine(to: project(p.x, p.y)) }
+                path.move(to: project(track[0]))
+                for p in track.dropFirst() { path.addLine(to: project(p)) }
                 context.stroke(path, with: .color(.gray), lineWidth: 2)
             }
             // start point
-            let start = project(0, 0)
+            let start = project(rotated((0, 0)))
             context.fill(Path(ellipseIn: CGRect(x: start.x - 3, y: start.y - 3, width: 6, height: 6)),
                          with: .color(.gray))
             // mirror candidate (hollow)
-            if let r = tracker.result, let m = r.mirror {
-                let c = project(m.x, m.y)
+            if let m = mirror {
+                let c = project(m)
                 context.stroke(Path(ellipseIn: CGRect(x: c.x - 8, y: c.y - 8, width: 16, height: 16)),
                                with: .color(.orange), lineWidth: 2)
             }
             // estimated position
-            if let r = tracker.result {
-                let c = project(r.x, r.y)
+            if let e = estimate {
+                let c = project(e)
                 context.fill(Path(ellipseIn: CGRect(x: c.x - 7, y: c.y - 7, width: 14, height: 14)),
                              with: .color(.red))
                 context.stroke(Path(ellipseIn: CGRect(x: c.x - 13, y: c.y - 13, width: 26, height: 26)),
                                with: .color(.red.opacity(0.6)), lineWidth: 1.5)
             }
             // current position
-            let me = project(tracker.posX, tracker.posY)
-            context.fill(Path(ellipseIn: CGRect(x: me.x - 6, y: me.y - 6, width: 12, height: 12)),
+            context.fill(Path(ellipseIn: CGRect(x: mePt.x - 6, y: mePt.y - 6, width: 12, height: 12)),
                          with: .color(.blue))
-            // north indicator
-            context.draw(Text("N").font(.caption.bold()), at: CGPoint(x: size.width - 14, y: 14))
+            // north indicator (rotates with the map in heading-up mode)
+            let th = tracker.headingDeg * .pi / 180
+            let nVec = headingUp ? (x: -sin(th), y: cos(th)) : (x: 0.0, y: 1.0)
+            let nPt = CGPoint(x: mePt.x + CGFloat(nVec.x) * 26, y: mePt.y - CGFloat(nVec.y) * 26)
+            context.draw(Text("N").font(.caption.bold()), at: nPt)
         }
     }
 }
@@ -286,7 +324,7 @@ struct HelpView: View {
                     Text("4. 赤い丸が推定位置。スマホを体の前に離して持つと精度が上がる")
                 }
                 Section("しくみ") {
-                    Text("電波の強さ（RSSI）から距離を推し量り、歩いた軌跡上の各地点からの距離を集めて、最もつじつまの合う一点を計算しています（多点測位）。あなたの移動は歩数計の距離とコンパスの方位で記録します。")
+                    Text("電波の強さ（RSSI）から距離を推し量り、歩いた軌跡上の各地点からの距離を集めて、最もつじつまの合う一点を計算しています（多点測位）。あなたの移動は加速度センサー由来の歩数・歩行距離と、ジャイロで補正した方位で記録します（GPSは数メートルぶれるので予備扱い）。地図はレーダー表示だと端末の向きに追随して回ります。")
                 }
                 Section("限界") {
                     Text("・画面を開いている間だけ動作します（バックグラウンド不可）")

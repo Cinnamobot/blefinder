@@ -5,9 +5,11 @@ import CoreLocation
 /// A tracking session: records the user's own movement, pairs each position
 /// with the target's RSSI-derived range, and multilaterates the target.
 ///
-/// Position source priority: GPS (when a decent fix is available) first,
-/// pedometer + compass dead reckoning as the indoor fallback. Sensor
-/// problems are surfaced via `notice` instead of failing silently.
+/// Position source: inertial dead reckoning first (pedometer step distance,
+/// which is accelerometer-driven, plus the gyro-fused heading from
+/// CMDeviceMotion). GPS jitters by metres — larger than the search area —
+/// so it is only a fallback for when the pedometer cannot run at all.
+/// Sensor problems are surfaced via `notice` instead of failing silently.
 final class Tracker: NSObject, ObservableObject {
     @Published var isRunning = false
     @Published var posX = 0.0   // east of start, metres
@@ -26,14 +28,20 @@ final class Tracker: NSObject, ObservableObject {
     var pathLoss = 2.0
 
     private let pedometer = CMPedometer()
+    private let motionManager = CMMotionManager()
     private let locationManager = CLLocationManager()
     private var samples: [SamplePoint] = []
     private var lastPedometerDistance = 0.0
     private var lastSampleAt = Date.distantPast
+    private var lastSamplePos: (x: Double, y: Double)?
     private var originLat: Double?
     private var originLon: Double?
-    private var lastGPSAt = Date.distantPast
+    private var pedometerFailed = false
+    private var headingFromMotion = false
     private var pedometerErrorReported = false
+
+    /// "慣性モード" while the pedometer drives the position, "GPSモード" in fallback.
+    var modeText: String { pedometerFailed ? "GPSモード（予備）" : "慣性モード（歩数＋ジャイロ方位）" }
 
     /// Farthest any track point is from the start point (movement check).
     var maxSpreadFromStart: Double {
@@ -50,13 +58,16 @@ final class Tracker: NSObject, ObservableObject {
     }
 
     func start() {
+        pedometerFailed = !CMPedometer.isDistanceAvailable()
         locationManager.requestWhenInUseAuthorization()
-        locationManager.startUpdatingLocation()
+        locationManager.startUpdatingLocation()  // GPS fallback + authorization only
         if CLLocationManager.headingAvailable() {
-            locationManager.startUpdatingHeading()
+            locationManager.startUpdatingHeading()  // fallback if device motion is unavailable
         }
+        startMotion()
         if CMPedometer.authorizationStatus() == .denied {
-            notice = "モーションの許可がありません（設定→プライバシーとセキュリティ→モーションとフィットネス）。GPSが使えない場所では移動を記録できません"
+            pedometerFailed = true
+            notice = "モーションの許可がありません（設定→プライバシーとセキュリティ→モーションとフィットネス）。GPSモードで代替します"
         }
         startPedometer()
         pedometerErrorReported = false
@@ -65,9 +76,25 @@ final class Tracker: NSObject, ObservableObject {
 
     func stop() {
         pedometer.stopUpdates()
+        motionManager.stopDeviceMotionUpdates()
         locationManager.stopUpdatingHeading()
         locationManager.stopUpdatingLocation()
         isRunning = false
+    }
+
+    /// Gyro-fused heading from CMDeviceMotion (magnetic-north reference frame).
+    /// heading = atan2(-m22, m12) of the attitude rotation matrix.
+    private func startMotion() {
+        guard motionManager.isDeviceMotionAvailable else { return }
+        motionManager.deviceMotionUpdateInterval = 1.0 / 30.0
+        motionManager.startDeviceMotionUpdates(using: .xMagneticNorthZVertical, to: .main) { [weak self] motion, _ in
+            guard let self, let motion else { return }
+            let m = motion.attitude.rotationMatrix
+            var deg = atan2(-m.m22, m.m12) * 180 / .pi
+            if deg < 0 { deg += 360 }
+            headingDeg = deg
+            headingFromMotion = true
+        }
     }
 
     func reset() {
@@ -78,7 +105,7 @@ final class Tracker: NSObject, ObservableObject {
         sampleCount = 0
         latestRange = nil
         originLat = nil; originLon = nil
-        lastGPSAt = .distantPast
+        lastSamplePos = nil
         usingGPS = false
         gpsAccuracy = nil
         lastPedometerDistance = 0
@@ -94,9 +121,10 @@ final class Tracker: NSObject, ObservableObject {
             guard let self else { return }
             if let error {
                 DispatchQueue.main.async {
+                    self.pedometerFailed = true
                     if !self.pedometerErrorReported {
                         self.pedometerErrorReported = true
-                        self.notice = "歩行データを取得できませんでした（\(error.localizedDescription)）。GPSで代替します"
+                        self.notice = "歩行データを取得できませんでした（\(error.localizedDescription)）。GPSモードで代替します"
                     }
                 }
                 return
@@ -110,7 +138,13 @@ final class Tracker: NSObject, ObservableObject {
         guard isRunning else { return }
         let now = Date()
         guard now.timeIntervalSince(lastSampleAt) > 0.35 else { return }
+        // Standing still piles every sample onto one point and poisons the
+        // solve; require real movement (or a long pause) between samples.
+        if let lp = lastSamplePos,
+           hypot(posX - lp.x, posY - lp.y) < 0.15,
+           now.timeIntervalSince(lastSampleAt) < 1.5 { return }
         lastSampleAt = now
+        lastSamplePos = (posX, posY)
         let d = Multilateration.distance(rssi: rssi, txPower: txPower, pathLossExponent: pathLoss)
         latestRange = d
         samples.append(SamplePoint(x: posX, y: posY, distance: d))
@@ -149,8 +183,7 @@ final class Tracker: NSObject, ObservableObject {
         let delta = total - lastPedometerDistance
         lastPedometerDistance = total
         guard delta > 0.03, delta < 5 else { return }
-        // GPS is fresh: trust it over dead reckoning.
-        if usingGPS, Date().timeIntervalSince(lastGPSAt) < 10 { return }
+        guard !pedometerFailed else { return }
         usingGPS = false
         let rad = headingDeg * .pi / 180
         setPosition(x: posX + delta * sin(rad), y: posY + delta * cos(rad))
@@ -159,6 +192,9 @@ final class Tracker: NSObject, ObservableObject {
     private func handleLocation(_ location: CLLocation) {
         let acc = location.horizontalAccuracy
         gpsAccuracy = acc >= 0 ? acc : nil
+        // GPS is jittery at this scale; use it only when inertial tracking
+        // cannot run at all.
+        guard pedometerFailed else { return }
         guard acc >= 0, acc <= 30 else { return }  // too rough to anchor on
         if originLat == nil {
             originLat = location.coordinate.latitude
@@ -170,7 +206,6 @@ final class Tracker: NSObject, ObservableObject {
         let metersPerDegLat = 110_574.0
         let x = (location.coordinate.longitude - lon0) * metersPerDegLon
         let y = (location.coordinate.latitude - lat0) * metersPerDegLat
-        lastGPSAt = Date()
         usingGPS = true
         setPosition(x: x, y: y)
     }
@@ -183,6 +218,7 @@ extension Tracker: CLLocationManagerDelegate {
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+        guard !headingFromMotion else { return }  // device motion heading is smoother
         let h = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
         headingDeg = h
     }
